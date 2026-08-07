@@ -1,152 +1,365 @@
 #!/usr/bin/env python3
-"""agentrouter.org 自动签到 - GitHub Actions 版（沿用 AnyRouter 成熟方案）"""
-import os, sys, json, time
+
+import os
+import sys
+import base64
+import json
+import time
+import subprocess
 import requests
 import traceback
 from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
-SITE_URL = os.getenv("SITE_URL", "https://agentrouter.org")
-SESSION  = os.getenv("SESSION", "")       # 登录后 cookie 的 session 值
-USER_ID  = os.getenv("USER_ID", "")       # 用户ID（可选，动态获取）
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID   = os.getenv("TG_CHAT_ID", "")
+# 环境变量配置(session建议填写secrets,需要自动更新)
+USER_ID      = os.getenv("USER_ID") or ""  # 用户ID,必填,登录后右上角个人设置里进去就看到ID了
+SESSION      = os.getenv("SESSION") or ""  # session必填,登录后F12→Application→Cookies 里找到 session 的值
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""  # Telegram bot token,不需要通知可以留空
+TG_CHAT_ID   = os.getenv("TG_CHAT_ID") or ""    # Telegram chat id
+
+SITE_URL = "https://agentrouter.org"
 SESSION_TTL_DAYS = 30
 SESSION_THRESHOLD_DAYS = 3
+QUOTA_PER_DOLLAR = 500000
 WAF_COOKIE_NAMES = ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
-DOMAIN = SITE_URL.replace("https://","").replace("http://","").split("/")[0]
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+# 工具函数
+def log(level: str, msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}", flush=True)
 
-def log(level, msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
-
-def send_tg(message):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("WARN", "TG 未配置，跳过")
-        print(f"--- 消息 ---\n{message}\n----------")
-        return
+def decode_session_timestamp(session_value: str) -> int | None:
+    if not session_value:
+        return None
+    parts = session_value.split("|")
+    if parts and parts[0].strip().isdigit():
+        return int(parts[0].strip())
+    if "%7C" in session_value or "%7c" in session_value:
+        decoded_url = session_value.replace("%7C", "|").replace("%7c", "|")
+        parts = decoded_url.split("|")
+        if parts and parts[0].strip().isdigit():
+            return int(parts[0].strip())
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=30)
-        log("INFO", "TG 发送成功")
-    except Exception as e:
-        log("ERROR", f"TG 失败: {e}")
+        padded = session_value + "=" * (4 - len(session_value) % 4) if len(session_value) % 4 else session_value
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+        except Exception:
+            decoded = base64.b64decode(padded)
+        decoded_str = decoded.decode("utf-8", errors="ignore")
+        parts = decoded_str.split("|")
+        if parts and parts[0].strip().isdigit():
+            return int(parts[0].strip())
+    except Exception:
+        pass
+    return None
 
-def get_waf_cookies():
-    """Playwright 访问登录页，尝试拿 WAF 放行 cookie (acw_sc__v2 等)"""
-    log("INFO", f"Playwright 获取 WAF cookie: {SITE_URL}/login")
-    waf={}
+def check_session_expiry(session_value: str):
+    timestamp = decode_session_timestamp(session_value)
+    if not timestamp:
+        log("WARN", "无法解码 Session 时间戳，跳过期检查")
+        return None, False
+    created_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    expiry_time = created_time + timedelta(days=SESSION_TTL_DAYS)
+    now = datetime.now(tz=timezone.utc)
+    remaining = expiry_time - now
+    remaining_days = remaining.total_seconds() / 86400
+    created_local = created_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    expiry_local = expiry_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    log("INFO", f"Session 创建时间: {created_local}")
+    log("INFO", f"Session 过期时间: {expiry_local}")
+    log("INFO", f"剩余有效时间: {remaining_days:.2f} 天")
+    need_update = remaining_days < SESSION_THRESHOLD_DAYS
+    if need_update:
+        log("WARN", f"Session 剩余 {remaining_days:.2f} 天 < {SESSION_THRESHOLD_DAYS} 天，需要更新！")
+    return remaining_days, need_update
+
+def update_github_secret(secret_name: str, new_value: str) -> bool:
+    if not new_value:
+        log("WARN", f"跳过更新 {secret_name}：新值为空")
+        return False
+    masked = new_value[:4] + "..." + new_value[-4:] if len(new_value) > 8 else "***"
+    log("INFO", f"🔄 更新 Secret: {secret_name} (新值: {masked})")
+    try:
+        proc = subprocess.run(
+            ["gh", "secret", "set", secret_name, "--body", new_value],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if proc.returncode == 0:
+            log("INFO", f"✅ {secret_name} 更新成功")
+            return True
+        else:
+            log("ERROR", f"更新失败: {proc.stderr.strip()}")
+            return False
+    except Exception as e:
+        log("ERROR", f"异常: {e}")
+        return False
+
+def send_telegram(message: str) -> bool:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("WARN", "Telegram 配置不完整，跳过发送")
+        print(f"--- 消息内容 ---\n{message}\n---------------")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        resp = requests.post(url, json=data, timeout=30)
+        resp.raise_for_status()
+        log("INFO", "Telegram 消息发送成功")
+        return True
+    except Exception as e:
+        log("ERROR", f"Telegram 发送失败: {e}")
+        return False
+
+# WAF Cookie 获取
+def get_waf_cookies() -> dict:
+    log("INFO", f"使用浏览器获取 WAF Cookie（访问 {SITE_URL}/login）...")
+    waf_cookies = {}
     with sync_playwright() as p:
-        b=p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"])
-        ctx=b.new_context(viewport={"width":1280,"height":720}, user_agent=UA)
-        page=ctx.new_page()
-        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
         try:
             page.goto(f"{SITE_URL}/login", wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
-            log("WARN", f"访问登录页失败: {e}")
-        # 等待 WAF JS 生成 cookie
-        for _ in range(4):
-            page.wait_for_timeout(2500)
-            for c in ctx.cookies():
-                if c["name"] in WAF_COOKIE_NAMES and c.get("value"):
-                    waf[c["name"]]=c["value"]
-            if waf:
-                break
-        b.close()
-    if waf:
-        log("INFO", f"获取到 WAF cookie: {list(waf.keys())}")
+            log("WARN", f"访问登录页面失败: {e}")
+        page.wait_for_timeout(3000)
+        cookies = context.cookies()
+        for cookie in cookies:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name in WAF_COOKIE_NAMES and value:
+                waf_cookies[name] = value
+        browser.close()
+    if waf_cookies:
+        log("INFO", f"获取到 {len(waf_cookies)} 个 WAF Cookie: {list(waf_cookies.keys())}")
     else:
-        log("WARN", "未获取到 WAF cookie（可能滑块强制）")
-    return waf
+        log("WARN", "未获取到 WAF Cookie")
+    return waf_cookies
 
-def build_headers(sid):
-    h={
-        "User-Agent":UA,
-        "Accept":"application/json, text/plain, */*",
-        "Accept-Language":"zh-CN,zh;q=0.9",
-        "Referer":SITE_URL,"Origin":SITE_URL,
-        "X-Requested-With":"XMLHttpRequest",
+# API 调用
+def build_headers() -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": SITE_URL,
+        "Origin": SITE_URL,
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "new-api-user": USER_ID,
     }
-    if sid is not None:
-        h["new-api-user"]=str(sid)
-    return h
 
-def get_user_info(sess, headers):
+def get_user_info(session: requests.Session, headers: dict) -> dict | None:
+    url = f"{SITE_URL}/api/user/self"
     try:
-        r=sess.get(f"{SITE_URL}/api/user/self", headers=headers, timeout=30)
-        if r.headers.get("content-type","").startswith("text/html"):
-            log("WARN", f"self 返回 WAF HTML (HTTP {r.status_code})")
-            return None
-        d=r.json()
-        if d.get("success"):
-            ud=d.get("data",{})
-            return {"quota":ud.get("quota",0),"used":ud.get("used_quota",0),
-                    "username":ud.get("username",""),"id":ud.get("id",0),"raw":ud}
-        log("WARN", f"self 非成功: {d}")
+        resp = session.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                user_data = data.get("data", {})
+                return {
+                    "quota": user_data.get("quota", 0),
+                    "used_quota": user_data.get("used_quota", 0),
+                    "username": user_data.get("username", ""),
+                    "id": user_data.get("id", 0),
+                    "raw": user_data,
+                }
+            else:
+                log("WARN", f"API 返回非成功: {data}")
+        else:
+            log("WARN", f"API HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        log("WARN", f"self 异常: {e}")
+        log("WARN", f"获取用户信息失败: {e}")
     return None
 
-def do_checkin(sess, headers):
-    try:
-        r=sess.post(f"{SITE_URL}/api/user/checkin", headers=headers, timeout=30)
-        if r.headers.get("content-type","").startswith("text/html"):
-            log("WARN", "checkin 返回 WAF HTML")
-            return "WAF"
-        d=r.json()
-        log("INFO", f"checkin 响应: {json.dumps(d, ensure_ascii=False)[:300]}")
-        if d.get("success"):
-            return "SUCCESS"
-        msg=str(d.get("message",""))
-        if any(k in msg for k in ["已经签到","已签到","重复签到","already"]):
-            return "DONE"
-        return f"FAIL:{msg}"
-    except Exception as e:
-        log("ERROR", f"checkin 异常: {e}")
-        return f"ERR:{e}"
+def do_check_in(session: requests.Session, headers: dict) -> bool:
+    # New API 标准签到接口；部分部署用 /api/user/sign_in
+    for path in ("/api/user/sign_in", "/api/user/checkin"):
+        url = f"{SITE_URL}{path}"
+        checkin_headers = headers.copy()
+        checkin_headers["Content-Type"] = "application/json"
+        checkin_headers["X-Requested-With"] = "XMLHttpRequest"
+        try:
+            resp = session.post(url, headers=checkin_headers, timeout=30)
+            log("INFO", f"签到接口响应 ({path}): HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                try:
+                    result = resp.json()
+                    if result.get("ret") == 1 or result.get("code") == 0 or result.get("success"):
+                        log("INFO", "✅ 签到成功！")
+                        return True
+                    error_msg = result.get("msg", result.get("message", "Unknown error"))
+                    already_keywords = ["已经签到", "已签到", "重复签到", "already checked", "already signed"]
+                    if any(kw in str(error_msg).lower() for kw in already_keywords):
+                        log("INFO", "今日已签到过")
+                        return True
+                    log("WARN", f"签到失败: {error_msg}")
+                except json.JSONDecodeError:
+                    if "success" in resp.text.lower():
+                        log("INFO", "✅ 签到成功！")
+                        return True
+                    log("WARN", f"签到响应格式异常: {resp.text[:200]}")
+            else:
+                log("WARN", f"签到失败: HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            log("ERROR", f"签到请求异常: {e}")
+    return False
 
-def run():
-    log("INFO","="*40)
-    log("INFO","agentrouter 自动签到启动")
+def format_balance(quota: int) -> str:
+    if quota is None:
+        return "N/A"
+    balance = quota / QUOTA_PER_DOLLAR
+    if balance == int(balance):
+        return f"{int(balance)}$"
+    return f"{balance:.2f}$"
+
+# 主流程
+def run_checkin():
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log("INFO", "=" * 50)
+    log("INFO", "Agentrouter 领币脚本启动")
+    log("INFO", f"时间: {now_str}")
+    log("INFO", f"用户 ID: {USER_ID}")
+    log("INFO", "=" * 50)
+
     if not SESSION:
-        log("ERROR","SESSION 未配置")
-        send_tg("❌ agentrouter 签到失败：SESSION 未配置")
-        return 1
+        log("ERROR", "SESSION 未配置，请设置 SESSION 环境变量")
+        sys.exit(1)
 
-    waf=get_waf_cookies()
-    sess=requests.Session()
-    for n,v in waf.items():
-        sess.cookies.set(n,v,domain=DOMAIN,path="/")
-    sess.cookies.set("session",SESSION,domain=DOMAIN,path="/")
+    # ---------- Step 1: 获取 WAF Cookie ----------
+    waf_cookies = get_waf_cookies()
+
+    # ---------- Step 2: 构建 HTTP Session ----------
+    session = requests.Session()
+    domain = SITE_URL.replace("https://", "").replace("http://", "").split("/")[0]
+
+    all_cookies = {}
+    all_cookies.update(waf_cookies)
+    all_cookies["session"] = SESSION
     if USER_ID:
-        sess.cookies.set("user_id",USER_ID,domain=DOMAIN,path="/")
+        all_cookies["user_id"] = USER_ID
 
-    headers=build_headers(None)
-    ui=get_user_info(sess,headers)
-    if not ui:
-        log("ERROR","API 验证失败：WAF 滑块未通过 或 session 过期")
-        send_tg("❌ agentrouter 签到失败：WAF 滑块未通过 / session 过期，需手动过滑块")
-        return 1
-    log("INFO",f"登录成功: {ui['username']} (id={ui['id']})")
-    sid=ui["id"]
-    headers=build_headers(sid)
+    for name, value in all_cookies.items():
+        session.cookies.set(name, value, domain=domain, path="/")
 
-    res=do_checkin(sess, headers)
-    log("INFO",f"签到结果: {res}")
-    send_tg(f"🎁 agentrouter 签到\n👤 {ui['username']} (id={sid})\n📋 {res}")
-    log("INFO","执行完毕")
-    return 0
+    log("INFO", f"已设置 {len(all_cookies)} 个 Cookie: {list(all_cookies.keys())}")
+
+    headers = build_headers()
+
+    # ---------- Step 3: 验证登录状态并获取初始余额 ----------
+    log("INFO", "通过 API 验证登录状态...")
+    user_info_1 = get_user_info(session, headers)
+
+    if not user_info_1:
+        log("ERROR", "API 验证失败，Session 可能已过期")
+        send_telegram(
+            f"❌ <b>Agentrouter 登录失败</b>\n"
+            f"👤 账户: {USER_ID or SESSION[:8]}...\n"
+            f"⏱️ 时间: {now_str}\n"
+            f"📝 原因: Session 已过期，请尽快更新 SESSION"
+        )
+        sys.exit(1)
+
+    log("INFO", "✅ 登录成功！（API 验证通过）")
+    username = user_info_1.get("username", "")
+    log("INFO", f"用户名: {username}")
+    if not USER_ID and user_info_1.get("id"):
+        USER_ID_G = str(user_info_1["id"])
+        headers["new-api-user"] = USER_ID_G
+        log("INFO", f"自动获取用户 ID: {USER_ID_G}")
+
+    first_balance = format_balance(user_info_1.get("quota", 0))
+    log("INFO", f"初始余额: {first_balance}")
+    log("INFO", f"API Quota: {user_info_1.get('quota')}, Used: {user_info_1.get('used_quota')}")
+
+    # ---------- Step 4: 签到领币 ----------
+    log("INFO", "执行签到领币...")
+    checkin_success = do_check_in(session, headers)
+
+    # ---------- Step 5: 等待 3 秒后重新获取余额 ----------
+    log("INFO", "等待 3 秒后重新获取余额...")
+    time.sleep(3)
+
+    user_info_2 = get_user_info(session, headers)
+    second_balance = format_balance(user_info_2.get("quota", 0)) if user_info_2 else "N/A"
+    log("INFO", f"刷新后余额: {second_balance}")
+    if user_info_2:
+        log("INFO", f"API Quota: {user_info_2.get('quota')}, Used: {user_info_2.get('used_quota')}")
+
+    # ---------- Step 6: 检查余额变化 ----------
+    balance_changed = first_balance != second_balance
+    if balance_changed:
+        log("INFO", f"✅ 余额发生变化: {first_balance} → {second_balance}")
+    else:
+        log("INFO", f"余额未变化: {first_balance}")
+
+    # ---------- Step 7: 检查 Session 有效期 ----------
+    remaining_days, need_update = check_session_expiry(SESSION)
+
+    # ---------- Step 8: 若 Session 即将过期，更新 GitHub Secret ----------
+    session_status = ""
+    if need_update:
+        log("WARN", "Session 即将过期，尝试更新 GitHub Secret...")
+        success = update_github_secret("SESSION", SESSION)
+        if success:
+            session_status = f"✅ Session 已自动更新（剩余 {remaining_days:.1f} 天）" if remaining_days else "✅ Session 已自动更新"
+        else:
+            session_status = f"⚠️ Session 剩余 {remaining_days:.1f} 天，Secret 更新失败，请手动更新" if remaining_days else "⚠️ Session 需手动更新"
+    else:
+        if remaining_days is not None:
+            session_status = f"✅ Session 有效（剩余 {remaining_days:.1f} 天）"
+        else:
+            session_status = "⚠️ Session 有效期未知"
+
+    # ---------- Step 9: 发送 Telegram 通知 ----------
+    message = (
+        f"🎁 <b>Agentrouter 签到通知</b>\n\n"
+        f"👤 登录账户: {username}\n"
+        f"💰 昨日余额: {first_balance}\n"
+        f"💰 当前余额: {second_balance}\n"
+        f"⏱️ 登录时间: {now_str}\n"
+        f"📋 {session_status}"
+    )
+    send_telegram(message)
+    log("INFO", "=== 脚本执行完毕 ===")
 
 def main():
     try:
-        return run()
+        run_checkin()
+    except KeyboardInterrupt:
+        log("WARN", "用户中断")
+        sys.exit(130)
     except Exception as e:
-        log("ERROR", f"{type(e).__name__}: {e}")
-        traceback.print_exc()
-        send_tg(f"❌ agentrouter 脚本异常\n📝 {type(e).__name__}: {e}")
-        return 1
+        error_msg = f"{type(e).__name__}: {e}"
+        log("ERROR", f"脚本执行出错: {error_msg}")
+        log("ERROR", traceback.format_exc())
+        send_telegram(
+            f"❌ <b>Agentrouter 脚本异常</b>\n"
+            f"👤 账户: {USER_ID or 'unknown'}\n"
+            f"⏱️ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📝 错误: {error_msg}"
+        )
+        sys.exit(1)
 
-if __name__=="__main__":
-    sys.exit(main())
+if __name__ == "__main__":
+    main()

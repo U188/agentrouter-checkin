@@ -2,7 +2,6 @@ name: AgentRouter Daily Check-in
 
 on:
   schedule:
-    # UTC 01:00 = 北京 09:00
     - cron: '0 1 * * *'
   workflow_dispatch:
 
@@ -14,28 +13,28 @@ jobs:
   checkin:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install Python dependencies
         run: |
           pip install requests playwright pynacl
           playwright install --with-deps chromium
 
-      - name: Run check-in
+      - name: Run check-in script
         env:
-          SESSION: ${{ secrets.AGENTROUTER_SESSION }}
-          USER_ID: ${{ secrets.AGENTROUTER_USER_ID }}
+          USER_ID: ${{ secrets.USER_ID }}
+          SESSION: ${{ secrets.SESSION }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python app.py
 
-      - name: clear old runs
+      - name: clear old run jobs
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,6 +44,7 @@ jobs:
           for run_id in $runs; do
             count=$((count + 1))
             if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
               gh run delete $run_id || true
             fi
           done
