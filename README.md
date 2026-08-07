@@ -8,10 +8,38 @@ fork 本项目 或 直接 push 到你自己的仓库后，在 **Settings → Sec
 
 | Secret 名称 | 是否必填 | 说明 |
 |---|---|---|
-| `SESSION` | ✅ 必填 | 登录 https://agentrouter.org 后，F12 → Application → Cookies → 复制 `session` 的值 |
-| `USER_ID` | 可选 | 用户 ID。不填时脚本会通过 `/api/user/self` 自动获取 |
-| `TG_BOT_TOKEN` | ❌ 可选 | Telegram Bot Token（通知用） |
-| `TG_CHAT_ID` | ❌ 可选 | Telegram Chat ID |
+| `SESSION` | 单账号必填 | 登录后 cookie 的 `session` 值。**多账号时用逗号分隔**，如 `sess1,sess2` |
+| `SESSIONS` | 多账号(推荐) | JSON 数组，支持给每个账号起名，优先级最高 |
+| `SESSION_IDS` | 可选 | 与 `SESSION` 逗号分隔对应的 `user_id` 列表（不填也能自动获取） |
+| `USER_ID` | 可选 | 单账号用户 ID（不填自动获取） |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | ❌ 可选 | Telegram 通知 |
+
+## 多账号配置（两种方式任选其一）
+
+### 方式一：SESSIONS（JSON，推荐，可命名）
+在 `SESSIONS` Secret 填如下 JSON，每个账号一个 session：
+
+```json
+[
+  {"name": "账号A", "session": "sessAAA...", "user_id": "1001"},
+  {"name": "账号B", "session": "sessBBB...", "user_id": "1002"},
+  {"name": "账号C", "session": "sessCCC..."}
+]
+```
+
+- `name` 可选（通知里显示）；`user_id` 可选（不填自动获取）。
+
+### 方式二：SESSION + SESSION_IDS（逗号分隔）
+`SESSION` 里用逗号放多个 session：
+```
+sessAAA...,sessBBB...,sessCCC...
+```
+`SESSION_IDS`（可选，与上面一一对应）：
+```
+1001,1002,1003
+```
+
+> 💡 配置后建议先去 **Actions → 你的工作流 → Run workflow** 手动跑一次验证。
 
 ## 手动获取 SESSION（一次性）
 
