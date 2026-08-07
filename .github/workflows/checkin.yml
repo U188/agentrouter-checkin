@@ -1,0 +1,50 @@
+name: AgentRouter Daily Check-in
+
+on:
+  schedule:
+    # UTC 01:00 = 北京 09:00
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install requests playwright pynacl
+          playwright install --with-deps chromium
+
+      - name: Run check-in
+        env:
+          SESSION: ${{ secrets.AGENTROUTER_SESSION }}
+          USER_ID: ${{ secrets.AGENTROUTER_USER_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python app.py
+
+      - name: clear old runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              gh run delete $run_id || true
+            fi
+          done
