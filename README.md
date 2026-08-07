@@ -16,18 +16,21 @@ fork 本项目 或 直接 push 到你自己的仓库后，在 **Settings → Sec
 
 ## 多账号配置（两种方式任选其一）
 
-### 方式一：SESSIONS（JSON，推荐，可命名）
-在 `SESSIONS` Secret 填如下 JSON，每个账号一个 session：
+### 方式一：SESSIONS（JSON 数组，推荐，可命名）
+在 `SESSIONS` Secret 填如下 **JSON 数组**（注意：必须用 `[ ]` 方括号，每个账号一对 `{ }`，用逗号分隔）：
 
 ```json
 [
   {"name": "账号A", "session": "sessAAA...", "user_id": "1001"},
-  {"name": "账号B", "session": "sessBBB...", "user_id": "1002"},
-  {"name": "账号C", "session": "sessCCC..."}
+  {"name": "账号B", "session": "sessBBB...", "user_id": "1002"}
 ]
 ```
 
 - `name` 可选（通知里显示）；`user_id` 可选（不填自动获取）。
+- 也可以偷懒：`SESSIONS` 直接填逗号分隔的 session 字符串，如：
+  ```
+  sessAAA...,sessBBB...
+  ```
 
 ### 方式二：SESSION + SESSION_IDS（逗号分隔）
 `SESSION` 里用逗号放多个 session：

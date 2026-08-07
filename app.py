@@ -240,17 +240,36 @@ def format_balance(quota: int) -> str:
 
 # 主流程
 def parse_accounts() -> list[dict]:
-    """解析账号列表，返回 [{name, session, user_id?}, ...]"""
+    """解析账号列表，返回 [{name, session, user_id?}, ...]
+
+    兼容三种填法：
+      1) SESSIONS 为 JSON 数组：[{"name":"A","session":"xxx","user_id":"1"}, ...]
+      2) SESSIONS 为逗号分隔的纯 session：sess1,sess2
+      3) 单账号 SESSION：xxx（或 SESSION 逗号分隔多账号）
+    """
     accounts: list[dict] = []
-    if SESSIONS:
-        data = json.loads(SESSIONS)
-        for item in data:
-            if isinstance(item, dict) and item.get("session"):
-                accounts.append({
-                    "name": str(item.get("name") or item["session"][:8]),
-                    "session": str(item["session"]),
-                    "user_id": str(item.get("user_id") or ""),
-                })
+    if SESSIONS and SESSIONS.strip():
+        txt = SESSIONS.strip().lstrip("\ufeff").strip()
+        # 尝试按 JSON 解析
+        try:
+            data = json.loads(txt)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("session"):
+                        accounts.append({
+                            "name": str(item.get("name") or str(item["session"])[:8]),
+                            "session": str(item["session"]),
+                            "user_id": str(item.get("user_id") or ""),
+                        })
+        except Exception:
+            pass
+        # JSON 解析失败或没解析出账号：按逗号分隔纯 session 处理
+        if not accounts:
+            sessions = [s.strip() for s in txt.replace("\n", ",").split(",") if s.strip()]
+            accounts = [
+                {"name": f"账号{i+1}", "session": s, "user_id": ""}
+                for i, s in enumerate(sessions)
+            ]
         if accounts:
             return accounts
     if SESSION:
@@ -323,9 +342,9 @@ def run_account_checkin(account: dict) -> dict:
 def run_checkin():
     accounts = parse_accounts()
     if not accounts:
-        log("ERROR", "未配置任何账号！请设置 SESSION 或 SESSIONS")
+        log("ERROR", "未配置任何账号！请设置 SESSIONS（JSON 数组或逗号分隔 session）或 SESSION")
         sys.exit(1)
-    log("INFO", f"共 {len(accounts)} 个账号")
+    log("INFO", f"共解析 {len(accounts)} 个账号: {[a['name'] for a in accounts]}")
 
     lines = ["🎁 <b>Agentrouter 签到通知</b>", f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
     all_result = []
